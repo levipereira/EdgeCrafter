@@ -566,8 +566,10 @@ class ViTAdapter(nn.Module):
     def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
         """Dispatch to _forward_single or _forward_tiled based on input size.
 
-        Routes to _forward_single for inputs <= tile_size on both dimensions,
-        otherwise uses _forward_tiled with sequential tile processing.
+        Routes to _forward_tiled only when the input is large enough to require
+        multiple tiles AND is tile-compatible (padded by PadToMultiple). Falls
+        back to _forward_single for standard-size inputs or when tiling is not
+        configured.
 
         Args:
             x: Input image tensor [B, 3, H, W].
@@ -576,8 +578,17 @@ class ViTAdapter(nn.Module):
             List of 3 projected feature maps at strides 8, 16, 32.
         """
         tile_size = getattr(self, 'tile_size', None)
-        if tile_size is not None and (x.shape[2] > tile_size or x.shape[3] > tile_size):
-            return self._forward_tiled(x)
+        tile_stride = getattr(self, 'tile_stride', None)
+        if tile_size is not None and tile_stride is not None:
+            h, w = x.shape[2], x.shape[3]
+            needs_tiling = h > tile_size or w > tile_size
+            is_compatible = (
+                h >= tile_size and w >= tile_size
+                and (h - tile_size) % tile_stride == 0
+                and (w - tile_size) % tile_stride == 0
+            )
+            if needs_tiling and is_compatible:
+                return self._forward_tiled(x)
         return self._forward_single(x)
 
     def _forward_single(self, x: torch.Tensor) -> list[torch.Tensor]:

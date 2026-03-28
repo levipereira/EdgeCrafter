@@ -115,6 +115,10 @@ class PadToMultiple(nn.Module):
     def forward(self, *inputs):
         """Pad the first input (image) and pass through all other inputs.
 
+        Handles both call conventions used by the Compose container:
+        - ``transform(img, target)`` → inputs = (img, target)
+        - ``transform((img, target))`` → inputs = ((img, target),)
+
         Args:
             *inputs: (image, targets_dict) or just (image,). Image must be a
                 tensor of shape [C, H, W].
@@ -122,6 +126,10 @@ class PadToMultiple(nn.Module):
         Returns:
             Same structure as input, with image padded right+bottom.
         """
+        # Compose passes a single tuple; unpack it
+        if len(inputs) == 1 and isinstance(inputs[0], tuple):
+            inputs = inputs[0]
+
         img = inputs[0]
         h_cur, w_cur = img.shape[-2], img.shape[-1]
         h_pad, w_pad = self._compute_padded_size(h_cur, w_cur)
