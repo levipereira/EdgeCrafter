@@ -35,6 +35,31 @@ class _ECBase(nn.Module):
 @register()
 class ECDet(_ECBase):
 
+    def __init__(
+        self,
+        backbone: nn.Module,
+        encoder: nn.Module,
+        decoder: nn.Module,
+        tile_size: int = 0,
+        tile_stride: int = 0,
+    ):
+        """Initialize ECDet with optional tiling parameters.
+
+        Args:
+            backbone: ViTAdapter backbone module.
+            encoder: HybridEncoder feature pyramid module.
+            decoder: ECTransformer decoder module.
+            tile_size: Tile side length in pixels for high-resolution mode.
+                When 0, tiling is disabled and input routes through
+                _forward_single regardless of size.
+            tile_stride: Step between adjacent tiles in pixels.
+                When 0, tiling is disabled.
+        """
+        super().__init__(backbone, encoder, decoder)
+        if tile_size > 0 and tile_stride > 0:
+            self.backbone.tile_size = tile_size
+            self.backbone.tile_stride = tile_stride
+
     def forward(self, x, targets=None):
         x = self.forward_features(x)
         return self.decoder(x, targets)

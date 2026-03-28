@@ -31,6 +31,69 @@ def safe_get_rank():
     return 0
 
 
+class TileExtractor(nn.Module):
+    """Extract overlapping tiles from a high-resolution frame using F.unfold.
+
+    Differentiable operation — gradients flow through normally. Input frames
+    must be tile-compatible: (H - tile_size) % stride == 0 and same for W.
+    Use PadToMultiple transform to ensure this before calling.
+
+    Args:
+        tile_size: Side length of each square tile in pixels.
+        stride: Step between adjacent tiles in pixels. Overlap = tile_size - stride.
+    """
+
+    def __init__(self, tile_size: int = 448, stride: int = 224):
+        super().__init__()
+        self.tile_size = tile_size
+        self.stride = stride
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        """Extract tiles from input frame.
+
+        Args:
+            x: Input tensor [B, C, H, W]. H and W must satisfy
+               (H - tile_size) % stride == 0 and (W - tile_size) % stride == 0.
+
+        Returns:
+            Tuple of (tiles, meta) where:
+                tiles: Tensor [B*N, C, tile_size, tile_size] with all tiles.
+                meta: Dict with keys B, N, nh, nw, H, W, tile_size, stride.
+
+        Raises:
+            AssertionError: If frame is smaller than tile_size or dimensions
+                are not tile-compatible.
+        """
+        B, C, H, W = x.shape
+        t = self.tile_size
+        s = self.stride
+
+        assert H >= t and W >= t, (
+            f"Frame {H}x{W} smaller than tile_size={t}. "
+            f"Use a smaller tile_size or pad the input."
+        )
+        assert (H - t) % s == 0 and (W - t) % s == 0, (
+            f"Frame {H}x{W} is not tile-compatible with tile_size={t}, stride={s}. "
+            f"Use PadToMultiple to pad before calling TileExtractor."
+        )
+
+        patches = F.unfold(x, kernel_size=t, stride=s)
+        N = patches.shape[-1]
+
+        tiles = patches.view(B, C, t, t, N).permute(0, 4, 1, 2, 3)
+        tiles = tiles.reshape(B * N, C, t, t)
+
+        nh = (H - t) // s + 1
+        nw = (W - t) // s + 1
+
+        meta = {
+            'B': B, 'N': N, 'nh': nh, 'nw': nw,
+            'H': H, 'W': W,
+            'tile_size': t, 'stride': s,
+        }
+        return tiles, meta
+
+
 class RopePositionEmbedding(nn.Module):
     def __init__(
         self,
@@ -323,13 +386,33 @@ class VisionTransformer(nn.Module):
             nn.init.zeros_(m.bias)
             nn.init.ones_(m.weight)
 
-    def forward(self, x):
+    def forward(
+        self, x: torch.Tensor, register_state: torch.Tensor | None = None
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        """Run ViT backbone on input tensor.
+
+        Args:
+            x: Input image tensor of shape [B, 3, H, W].
+            register_state: Optional accumulated register state of shape
+                [B, 1, embed_dim]. When None, uses the learned register_token
+                parameter (original behavior).
+
+        Returns:
+            Tuple of (outs, final_register) where:
+                outs: List of feature tensors from return_layers, each [B, H*W, D].
+                final_register: Updated register token [B, 1, D] after all blocks.
+        """
         outs = []
         x_embed = self.patch_embed(x)
         _, _, H, W = x_embed.shape
-        
+
         x_embed = x_embed.flatten(2).transpose(1, 2)
-        register_token = self.register_token.expand(x_embed.shape[0], -1, -1)
+
+        if register_state is not None:
+            register_token = register_state
+        else:
+            register_token = self.register_token.expand(x_embed.shape[0], -1, -1)
+
         x = torch.cat((register_token, x_embed), dim=1)
         rope_sincos = self.rope_embed(H=H, W=W)
 
@@ -337,7 +420,9 @@ class VisionTransformer(nn.Module):
             x = blk(x, rope_sincos=rope_sincos)
             if i in self.return_layers:
                 outs.append(x[:, 1:])
-        return outs
+
+        final_register = x[:, :1, :]
+        return outs, final_register
     
     
 
@@ -417,6 +502,12 @@ class ViTAdapter(nn.Module):
         self.proj_dim = [proj_dim] * num_levels if proj_dim is not None else [embed_dim]
 
         self.projector = nn.ModuleList([ConvNormLayer_fuse(embed_dim, dim, kernel_size=1, stride=1) for dim in self.proj_dim])
+
+        # CRITICAL-3 fix: global tile position encoding for register state.
+        # Projects normalized (col/nw, row/nh) grid coordinates into embed_dim
+        # so the register token knows where each tile is in the frame.
+        # Cost: 2*embed_dim + embed_dim = 384+192 = 576 params for ECDet-S.
+        self.tile_pos_proj = nn.Linear(2, embed_dim)
         
     def _load_weights(self, weights_path):
         if self.name not in self.ecvit_url:
@@ -472,30 +563,174 @@ class ViTAdapter(nn.Module):
 
 
     
-    def forward(self, x):
-        
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """Dispatch to _forward_single or _forward_tiled based on input size.
+
+        Routes to _forward_single for inputs <= tile_size on both dimensions,
+        otherwise uses _forward_tiled with sequential tile processing.
+
+        Args:
+            x: Input image tensor [B, 3, H, W].
+
+        Returns:
+            List of 3 projected feature maps at strides 8, 16, 32.
+        """
+        tile_size = getattr(self, 'tile_size', None)
+        if tile_size is not None and (x.shape[2] > tile_size or x.shape[3] > tile_size):
+            return self._forward_tiled(x)
+        return self._forward_single(x)
+
+    def _forward_single(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """Original forward path. Fully backward-compatible with pretrained weights.
+
+        Args:
+            x: Input image tensor [B, 3, H, W].
+
+        Returns:
+            List of 3 projected feature maps at strides 8, 16, 32.
+        """
         H_c, W_c = x.shape[2] // self.patch_size, x.shape[3] // self.patch_size
         bs = x.shape[0]
 
-        return_layers = self.backbone(x)
-        
-        # fused_feats = (return_layers[0] + return_layers[1]) / 2
+        return_layers, _ = self.backbone(x)
+
         fused_feats = torch.mean(torch.stack(return_layers), dim=0)
 
+        fused_feats = fused_feats.transpose(1, 2).contiguous().view(bs, -1, H_c, W_c)
         proj_feats = []
-        fused_feats = fused_feats.transpose(1, 2).contiguous().view(bs, -1, H_c, W_c)  # [B, D, H, W]
         for i in range(self.num_levels):
             scale = 2 ** (1 - i)
             resize_H = int(H_c * scale)
             resize_W = int(W_c * scale)
             feature = F.interpolate(fused_feats, size=[resize_H, resize_W], mode="bilinear", align_corners=False)
             proj_feats.append(feature)
-            
+
         if len(self.projector) == 1:
             proj_feats[-1] = self.projector[-1](proj_feats[-1])
         else:
             proj_feats = [layer(feat) for layer, feat in zip(self.projector, proj_feats)]
-            
+
         return proj_feats
+
+    def _forward_tiled(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """Process a high-resolution frame through sequential tile passes.
+
+        Extracts overlapping tiles, passes each through the shared ViT backbone,
+        then reassembles a global feature map by averaging overlapping tile features.
+        Currently stateless (no register accumulation) — each tile uses the default
+        register_token parameter independently.
+
+        Args:
+            x: Input frame tensor [B, 3, H, W] where H or W > tile_size.
+               Must be tile-compatible: (H - tile_size) % tile_stride == 0.
+
+        Returns:
+            List of 3 projected feature maps at strides 8, 16, 32 relative to
+            the input frame dimensions.
+
+        Note:
+            BatchNorm layers in patch_embed are forced to eval() mode during this
+            call to preserve pretrained running statistics (CRITICAL-2).
+        """
+        tile_size = self.tile_size
+        tile_stride = self.tile_stride
+        embed_dim = self.backbone.embed_dim
+
+        # CRITICAL-2: freeze BN in patch_embed to preserve pretrained stats
+        patch_embed_bn_training = {}
+        for name, m in self.backbone.patch_embed.named_modules():
+            if isinstance(m, nn.BatchNorm2d):
+                patch_embed_bn_training[name] = m.training
+                m.eval()
+
+        try:
+            extractor = TileExtractor(tile_size=tile_size, stride=tile_stride)
+            tiles, meta = extractor(x)
+
+            B = meta['B']
+            N = meta['N']
+            nh = meta['nh']
+            nw = meta['nw']
+            H = meta['H']
+            W = meta['W']
+
+            tile_feat_h = tile_size // self.patch_size
+            tile_feat_w = tile_size // self.patch_size
+            global_feat_h = H // self.patch_size
+            global_feat_w = W // self.patch_size
+            stride_feat = tile_stride // self.patch_size
+
+            device = x.device
+            dtype = x.dtype
+            global_feat = torch.zeros(
+                B, embed_dim, global_feat_h, global_feat_w,
+                device=device, dtype=dtype,
+            )
+            global_count = torch.zeros(
+                B, 1, global_feat_h, global_feat_w,
+                device=device, dtype=dtype,
+            )
+
+            register_state = self.backbone.register_token.expand(B, -1, -1).clone()
+
+            for tile_idx in range(N):
+                tile_batch = tiles[tile_idx::N]
+
+                row = tile_idx // nw
+                col = tile_idx % nw
+
+                # CRITICAL-3 fix: inject global tile position into register state
+                tile_pos = torch.tensor(
+                    [[col / nw, row / nh]],
+                    device=device, dtype=dtype,
+                )
+                pos_signal = self.tile_pos_proj(tile_pos).unsqueeze(0).expand(B, -1, -1)
+                tile_register = register_state + pos_signal
+
+                return_layers, new_register = self.backbone(
+                    tile_batch, register_state=tile_register,
+                )
+
+                # Truncated BPTT: detach between tiles to prevent gradient explosion
+                register_state = new_register.detach()
+
+                fused_tile = torch.mean(torch.stack(return_layers), dim=0)
+                fused_tile = fused_tile.transpose(1, 2).contiguous()
+                fused_tile = fused_tile.view(B, embed_dim, tile_feat_h, tile_feat_w)
+
+                y0 = row * stride_feat
+                x0 = col * stride_feat
+                y1 = y0 + tile_feat_h
+                x1 = x0 + tile_feat_w
+
+                global_feat[:, :, y0:y1, x0:x1] += fused_tile
+                global_count[:, :, y0:y1, x0:x1] += 1.0
+
+            global_count = global_count.clamp(min=1.0)
+            global_feat = global_feat / global_count
+
+            proj_feats = []
+            for i in range(self.num_levels):
+                scale = 2 ** (1 - i)
+                resize_H = int(global_feat_h * scale)
+                resize_W = int(global_feat_w * scale)
+                feature = F.interpolate(
+                    global_feat, size=[resize_H, resize_W],
+                    mode="bilinear", align_corners=False,
+                )
+                proj_feats.append(feature)
+
+            if len(self.projector) == 1:
+                proj_feats[-1] = self.projector[-1](proj_feats[-1])
+            else:
+                proj_feats = [layer(feat) for layer, feat in zip(self.projector, proj_feats)]
+
+            return proj_feats
+
+        finally:
+            # Restore BN training state
+            for name, m in self.backbone.patch_embed.named_modules():
+                if isinstance(m, nn.BatchNorm2d) and name in patch_embed_bn_training:
+                    m.train(patch_embed_bn_training[name])
         
     

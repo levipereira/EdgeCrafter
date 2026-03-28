@@ -3,6 +3,7 @@ Copied from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
+import math
 from typing import Any, Dict, List, Optional
 
 import PIL
@@ -72,6 +73,72 @@ class PadToSize(T.Pad):
         outputs = super().forward(*inputs)
         if len(outputs) > 1 and isinstance(outputs[1], dict):
             outputs[1]['padding'] = torch.tensor(self.padding)
+        return outputs
+
+
+@register()
+class PadToMultiple(nn.Module):
+    """Pad image so tiles fully cover the frame.
+
+    Pads right and bottom only to the nearest size where
+    (H - tile_size) % stride == 0 and H >= tile_size. When tile_size is a
+    multiple of stride (e.g. 448 = 2*224), this is equivalent to padding H
+    to the nearest multiple of stride that is >= tile_size.
+
+    Bbox coordinates are NOT shifted because padding is right+bottom only —
+    normalized [0,1] coordinates computed before padding remain valid.
+
+    Must be placed AFTER ConvertPILImage in the transform pipeline (operates
+    on tensors, not PIL images).
+
+    Args:
+        tile_size: Side length of each tile in pixels.
+        stride: Step between adjacent tiles in pixels.
+        fill: Fill value for padded pixels. Default 0.
+    """
+
+    def __init__(
+        self, tile_size: int = 448, stride: int = 224, fill: float = 0,
+    ) -> None:
+        super().__init__()
+        self.tile_size = tile_size
+        self.stride = stride
+        self.fill = fill
+
+    def _compute_padded_size(self, h: int, w: int) -> tuple[int, int]:
+        """Compute the padded dimensions for tile compatibility."""
+        t, s = self.tile_size, self.stride
+        h_pad = t + math.ceil((h - t) / s) * s if h > t else t
+        w_pad = t + math.ceil((w - t) / s) * s if w > t else t
+        return h_pad, w_pad
+
+    def forward(self, *inputs):
+        """Pad the first input (image) and pass through all other inputs.
+
+        Args:
+            *inputs: (image, targets_dict) or just (image,). Image must be a
+                tensor of shape [C, H, W].
+
+        Returns:
+            Same structure as input, with image padded right+bottom.
+        """
+        img = inputs[0]
+        h_cur, w_cur = img.shape[-2], img.shape[-1]
+        h_pad, w_pad = self._compute_padded_size(h_cur, w_cur)
+        pad_bottom = h_pad - h_cur
+        pad_right = w_pad - w_cur
+
+        padding = [0, 0, pad_right, pad_bottom]
+
+        if pad_bottom > 0 or pad_right > 0:
+            img = F.pad(img, padding=padding, fill=self.fill, padding_mode='constant')
+
+        if len(inputs) == 1:
+            return img
+
+        outputs = (img,) + inputs[1:]
+        if len(outputs) > 1 and isinstance(outputs[1], dict):
+            outputs[1]['padding'] = torch.tensor(padding)
         return outputs
 
 
