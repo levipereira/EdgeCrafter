@@ -33,10 +33,10 @@ ECTransformer:
   num_layers: 4
   eval_idx: -1
 
-# Dynamic anchors are always used during training regardless of this value.
-# Set to [640,640] to satisfy reset_cfg() config parsing.
-# For tiled eval, override to None or pass actual padded size.
-eval_spatial_size: [640, 640]
+# Null forces HybridEncoder and ECTransformer to build positional embeddings
+# and anchors dynamically from the actual feature map size every forward pass.
+# Required for tiled mode because the padded input size differs from 640x640.
+eval_spatial_size: ~
 
 train_dataloader:
   dataset:
@@ -62,7 +62,7 @@ train_dataloader:
     mixup_prob: 0.0
     mixup_epoch: 0
 
-  total_batch_size: 4
+  total_batch_size: 8
 
 val_dataloader:
   dataset:
@@ -72,7 +72,7 @@ val_dataloader:
         - {type: ConvertPILImage, dtype: 'float32', scale: True}
         - {type: PadToMultiple, tile_size: 448, stride: 224}
         - {type: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
-  total_batch_size: 2
+  total_batch_size: 8
 
 # Training schedule — Phase 1 only (backbone frozen)
 # Phase 2 (unfreeze backbone with low LR) requires a separate config or
@@ -105,6 +105,8 @@ optimizer:
   lr: 0.0002
   betas: [0.9, 0.999]
   weight_decay: 0.0001
+
+print_freq: 50
 
 use_amp: True
 use_ema: True

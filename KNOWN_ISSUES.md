@@ -240,3 +240,54 @@ the variable-size, padding-based input used in tiled mode.
 **Fix:**
 Tiled config (`ecdet_s_visdrone_tiled.yml`) sets `mosaic_prob: 0.0` and `mixup_prob: 0.0`.
 These augmentations are excluded from the tiled training pipeline by configuration.
+
+---
+
+## CRITICAL-4: reset_cfg() overrides Resize to square and eval pos_embed mismatch
+
+**Status:** Fixed
+**Repository:** `https://github.com/levipereira/EdgeCrafter`
+
+**Root cause:**
+Two compounding issues caused a crash at the start of the first evaluation:
+
+1. `YAMLConfig.reset_cfg()` (`engine/core/yaml_config.py` line 182) reads
+   `eval_spatial_size[0]` and overrides every `Resize` transform in both train
+   and val pipelines to `(input_size, input_size)` — always square.  The tiled
+   config specified `Resize(size=[896, 1344])` for VisDrone's 16:9 aspect ratio,
+   but `reset_cfg()` silently replaced it with `(640, 640)`.
+
+2. With `eval_spatial_size: [640, 640]`, `HybridEncoder` and `ECTransformer`
+   cache positional embeddings and anchors built for 640×640 feature maps.
+   During evaluation (`model.eval()`, `self.training=False`) these cached
+   tensors are used instead of building dynamic ones.  After `PadToMultiple`
+   pads 640→672 (the next tile-compatible size), the actual feature map at
+   stride 32 is 21×21 = 441 tokens, but the cached pos_embed has 20×20 = 400
+   tokens.  Result: `RuntimeError: size 441 vs 400 at dimension 1`.
+
+**Chain of events:**
+```
+eval_spatial_size=[640,640]
+  → reset_cfg() overrides Resize to (640,640)
+  → PadToMultiple(448,224) pads 640→672
+  → _forward_tiled produces level-2 feature 21×21 = 441 tokens
+  → HybridEncoder eval uses cached pos_embed for 640/32 = 20×20 = 400 tokens
+  → tensor + pos_embed → shape mismatch crash
+```
+
+**Affected files:**
+- `engine/core/yaml_config.py` — `reset_cfg()` (line 182-198)
+- `configs/ecdet/ecdet_s_visdrone_tiled.yml` — `eval_spatial_size` setting
+- `engine/edgecrafter/hybrid_encoder.py` — cached `pos_embed` (lines 386-394, 423-427)
+- `engine/edgecrafter/decoder.py` — cached `anchors` (lines 523-529, 651-654)
+
+**Fix:**
+1. Set `eval_spatial_size: ~` (null) in the tiled config.  This forces both
+   `HybridEncoder` and `ECTransformer` to compute positional embeddings and
+   anchors dynamically from the actual feature map dimensions on every forward
+   pass — matching any input size.
+2. Guard `reset_cfg()` to skip Resize/Mosaic overrides when `eval_spatial_size`
+   is null, preserving the config-specified non-square transform sizes.
+
+**Note:** The first training epoch ran on 672×672 images (not 896×1344), so
+the checkpoint from that run is invalid and training must restart from scratch.

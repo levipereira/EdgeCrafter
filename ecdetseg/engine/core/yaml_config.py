@@ -177,32 +177,39 @@ class YAMLConfig(BaseConfig):
         return loader
 
     def reset_cfg(self):
-        """reset tranforms size according to input size, and check stop_epoch for training transforms.
+        """Reset transform sizes according to input size and check stop_epoch.
+
+        When ``eval_spatial_size`` is set (e.g. ``[640, 640]``), Resize and
+        Mosaic transforms are overridden to match that square size.  When it is
+        ``None`` (tiled mode), the config-specified transform sizes are
+        preserved as-is because the tiled pipeline manages its own sizes.
         """
-        input_size = self.yaml_cfg['eval_spatial_size'][0]
-        
         def simple_glom(data, path):
             for key in path.split("."):
                 data = data[key]
             return data
-        
-        train_ops = simple_glom(self.yaml_cfg, 'train_dataloader.dataset.transforms.ops')
-        val_ops = simple_glom(self.yaml_cfg, 'val_dataloader.dataset.transforms.ops')
-        
-        for ops in [train_ops, val_ops]:
-            for op in ops:
-                t = op.get("type")
-                if t == "Mosaic":
-                    op["output_size"] = input_size // 2
-                elif t == "Resize":
-                    op["size"] = (input_size, input_size)
-        
+
+        eval_spatial_size = self.yaml_cfg.get('eval_spatial_size', None)
+        if eval_spatial_size is not None:
+            input_size = eval_spatial_size[0]
+
+            train_ops = simple_glom(self.yaml_cfg, 'train_dataloader.dataset.transforms.ops')
+            val_ops = simple_glom(self.yaml_cfg, 'val_dataloader.dataset.transforms.ops')
+
+            for ops in [train_ops, val_ops]:
+                for op in ops:
+                    t = op.get("type")
+                    if t == "Mosaic":
+                        op["output_size"] = input_size // 2
+                    elif t == "Resize":
+                        op["size"] = (input_size, input_size)
+
         stop_aug_epoch = simple_glom(self.yaml_cfg, 'train_dataloader.dataset.transforms.stop_epoch')
         epochs = self.yaml_cfg['epochs']
         no_aug_epoch = epochs - stop_aug_epoch
         if not 0 <= no_aug_epoch <= 5:
             self.yaml_cfg['train_dataloader']['dataset']['transforms']['stop_epoch'] = epochs - 2
-            
+
             import warnings
             warnings.warn(
                 "'stop_epoch' was not correctly set for training transforms. "
